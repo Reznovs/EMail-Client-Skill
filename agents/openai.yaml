@@ -1,0 +1,7 @@
+interface:
+  display_name: "Email Client"
+  short_description: "Use bundled local tools for mailbox workflows."
+  default_prompt: "Use $email-client-skill to handle mailbox setup, reading, attachment work, drafting, or sending with its bundled local tools."
+
+policy:
+  allow_implicit_invocation: true

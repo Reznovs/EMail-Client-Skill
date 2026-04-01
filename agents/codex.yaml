@@ -1,0 +1,17 @@
+interface:
+  display_name: "Email Client"
+  short_description: "Use bundled local tools for mailbox workflows across Gmail, QQ, and custom IMAP/SMTP accounts."
+  default_prompt: "Use the email-client-skill to handle mailbox setup, reading, attachment work, drafting, or sending with its bundled local tools."
+
+policy:
+  allow_implicit_invocation: true
+
+# Codex 特定配置
+codex:
+  skill_path: "SKILL.md"
+  tool_executable: "python3 scripts/mail_tools.py"
+  requires_python: true
+  supported_providers:
+    - gmail
+    - qq
+    - custom

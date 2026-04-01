@@ -1,0 +1,22 @@
+interface:
+  display_name: "Email Client"
+  short_description: "Use bundled local tools for mailbox workflows across Gmail, QQ, and custom IMAP/SMTP accounts."
+  default_prompt: "Use the email-client-skill to handle mailbox setup, reading, attachment work, drafting, or sending with its bundled local tools."
+
+policy:
+  allow_implicit_invocation: true
+  invocations:
+    - name: "email_client"
+      description: "Use when user asks about email, mailbox, IMAP, SMTP, send mail, read mail, attachments"
+      trigger: ["email", "mail", "mailbox", "imap", "smtp", "send mail", "inbox", "attachment"]
+
+# Claude Code 特定配置
+claude_code:
+  skill_path: "SKILL.md"
+  tool_executable: "python3 scripts/mail_tools.py"
+  requires_python: true
+  python_version: ">=3.10"
+  supported_providers:
+    - gmail
+    - qq
+    - custom
