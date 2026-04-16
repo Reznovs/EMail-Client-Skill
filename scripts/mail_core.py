@@ -1561,14 +1561,29 @@ def send_email_tool(
     config_path: str | Path | None = None,
     html_body: str | None = None,
     attachments: list[str] | None = None,
+    tone: str = "colleague",
+    to_name: str = "",
+    sender_name: str = "",
 ) -> dict[str, Any]:
     mailbox = load_account(account, config_path)
+
+    # 如果没有提供 html_body,自动生成 HTML 格式
+    final_html_body = html_body
+    if final_html_body is None:
+        _, final_html_body = compose_email_body(
+            subject=subject,
+            content=body,
+            tone=tone,
+            to_name=to_name,
+            sender_name=sender_name or mailbox.display_name,
+        )
+
     return send_email(
         mailbox,
         to=to,
         subject=subject,
         body=body,
-        html_body=html_body,
+        html_body=final_html_body,
         attachments=attachments,
     )
 
@@ -1610,33 +1625,62 @@ def test_login(
     }
 
 
-def compose_email_body(subject: str, content: str, tone: str, to_name: str, sender_name: str) -> str:
+def compose_email_body(subject: str, content: str, tone: str, to_name: str, sender_name: str) -> tuple[str, str]:
+    """生成邮件正文,返回 (纯文本版本, HTML版本)"""
     greeting_name = to_name or "there"
     sign_name = sender_name or "[Your Name]"
     stripped = content.strip()
+
+    # 将换行转换为 HTML 段落
+    html_content = stripped.replace("\n\n", "</p><p>").replace("\n", "<br>")
+
     if tone == "formal":
-        return (
+        text_body = (
             f"Hello {greeting_name},\n\n"
             f"I am writing regarding {subject}.\n\n"
             f"{stripped}\n\n"
             "Please let me know if you would like me to provide any additional detail.\n\n"
             f"Best regards,\n{sign_name}"
         )
-    if tone == "support":
-        return (
+        html_body = (
+            f"<p>Hello <strong>{greeting_name}</strong>,</p>"
+            f"<p>I am writing regarding <em>{subject}</em>.</p>"
+            f"<p>{html_content}</p>"
+            "<p>Please let me know if you would like me to provide any additional detail.</p>"
+            f"<p>Best regards,<br>{sign_name}</p>"
+        )
+    elif tone == "support":
+        text_body = (
             f"Hello {greeting_name},\n\n"
             f"This message is about {subject}.\n\n"
             f"{stripped}\n\n"
             "If you need anything else, please reply to this email and I will follow up.\n\n"
             f"Regards,\n{sign_name}"
         )
-    return (
-        f"Hi {greeting_name},\n\n"
-        f"I wanted to follow up on {subject}.\n\n"
-        f"{stripped}\n\n"
-        "Let me know if you want me to adjust anything or send a revised version.\n\n"
-        f"Thanks,\n{sign_name}"
-    )
+        html_body = (
+            f"<p>Hello <strong>{greeting_name}</strong>,</p>"
+            f"<p>This message is about <em>{subject}</em>.</p>"
+            f"<p>{html_content}</p>"
+            "<p>If you need anything else, please reply to this email and I will follow up.</p>"
+            f"<p>Regards,<br>{sign_name}</p>"
+        )
+    else:  # colleague
+        text_body = (
+            f"Hi {greeting_name},\n\n"
+            f"I wanted to follow up on {subject}.\n\n"
+            f"{stripped}\n\n"
+            "Let me know if you want me to adjust anything or send a revised version.\n\n"
+            f"Thanks,\n{sign_name}"
+        )
+        html_body = (
+            f"<p>Hi <strong>{greeting_name}</strong>,</p>"
+            f"<p>I wanted to follow up on <em>{subject}</em>.</p>"
+            f"<p>{html_content}</p>"
+            "<p>Let me know if you want me to adjust anything or send a revised version.</p>"
+            f"<p>Thanks,<br>{sign_name}</p>"
+        )
+
+    return text_body, html_body
 
 
 def draft_email(
@@ -1650,7 +1694,7 @@ def draft_email(
 ) -> dict[str, Any]:
     if tone not in {"colleague", "formal", "support"}:
         raise EmailClientError("tone must be colleague, formal, or support", code="invalid_request")
-    draft = compose_email_body(
+    text_draft, html_draft = compose_email_body(
         subject=subject,
         content=body,
         tone=tone,
@@ -1660,12 +1704,14 @@ def draft_email(
     output_path = ""
     if output:
         output_path = str(Path(output).expanduser())
-        Path(output_path).write_text(draft, encoding="utf-8")
+        # 保存 HTML 版本到文件
+        Path(output_path).write_text(html_draft, encoding="utf-8")
     return {
         "status": "ok",
         "subject": subject,
         "tone": tone,
-        "draft": draft,
+        "draft": text_draft,  # 返回纯文本版本用于预览
+        "html_draft": html_draft,  # 同时返回 HTML 版本
         "output_path": output_path,
     }
 
