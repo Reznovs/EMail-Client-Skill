@@ -1,24 +1,17 @@
 {
-  "version": 2,
-  "accounts": {
-    "default-send": {
-      "provider": "qq",
-      "identity": {
-        "email": "your_qq@qq.com",
-        "login_user": "your_qq@qq.com",
-        "display_name": "Your Name"
-      },
-      "auth": {
-        "mode": "auth_code",
-        "storage": "config_file",
-        "secret": "<QQ_AUTH_CODE_HERE>",
-        "keyring_key": null
-      },
-      "servers": {
-        "imap": { "host": "imap.qq.com", "port": 993, "security": "ssl" },
-        "smtp": { "host": "smtp.qq.com", "port": 465, "security": "ssl" }
-      },
-      "proxy": null
-    }
-  }
+  "setup": 1,
+  "sender": {
+    "email": "your_qq@qq.com",
+    "login_user": "your_qq@qq.com",
+    "display_name": "AI Agent",
+    "provider": "qq",
+    "auth_code": "<QQ_AUTH_CODE_HERE>",
+    "imap": { "host": "imap.qq.com", "port": 993, "security": "ssl" },
+    "smtp": { "host": "smtp.qq.com", "port": 465, "security": "ssl" },
+    "resend_api_key": ""
+  },
+  "recipients": [
+    { "email": "main_target@example.com", "name": "Main Contact", "main": true },
+    { "email": "other@example.com", "name": "Other Contact", "main": false }
+  ]
 }

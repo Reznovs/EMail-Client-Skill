@@ -8,12 +8,14 @@ __pycache__/
 *.swo
 
 # 本地凭据与运行产物（绝不进仓库）
+config/
 accounts.json
 accounts.local.json
 audit.log
 .codex-mail-attachments.json
 .mail-ops-attachments.json
 *.ics.local
+CLAUDE.md
 
 # 但示例文件要允许
 !references/accounts.example.json

@@ -16,22 +16,6 @@ import mail_core
 import mail_tools
 
 
-class DummyKeyring:
-    store: dict[tuple[str, str], str] = {}
-
-    @classmethod
-    def set_password(cls, service: str, name: str, secret: str) -> None:
-        cls.store[(service, name)] = secret
-
-    @classmethod
-    def get_password(cls, service: str, name: str) -> str | None:
-        return cls.store.get((service, name))
-
-    @classmethod
-    def delete_password(cls, service: str, name: str) -> None:
-        cls.store.pop((service, name), None)
-
-
 class FakeMailClient:
     def __init__(self, account):
         self.account = account
@@ -127,121 +111,151 @@ class FakeSMTP:
         self.__class__.sent_messages.append(msg)
 
 
+def _new_config(path: Path, *, auth_code: str = "real-secret") -> Path:
+    """创建新格式配置文件，返回路径。"""
+    path.write_text(
+        json.dumps({
+            "setup": 1,
+            "sender": {
+                "email": "user@example.com",
+                "login_user": "user@example.com",
+                "display_name": "Test User",
+                "provider": "gmail",
+                "auth_code": auth_code,
+                "imap": {"host": "imap.gmail.com", "port": 993, "security": "ssl"},
+                "smtp": {"host": "smtp.gmail.com", "port": 465, "security": "ssl"},
+            },
+            "recipients": [
+                {"email": "main@example.com", "name": "Main", "main": True},
+                {"email": "other@example.com", "name": "Other", "main": False},
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
 class MailToolsTests(unittest.TestCase):
     def setUp(self) -> None:
-        DummyKeyring.store = {}
         FakeSMTP.sent_messages = []
 
-    def test_migrate_config_creates_v2_shape(self) -> None:
+    def test_setup_account_creates_new_format(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "accounts.json"
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "accounts": [
-                            {
-                                "name": "work",
-                                "provider": "gmail",
-                                "email": "user@example.com",
-                                "login_user": "user@example.com",
-                                "display_name": "User",
-                                "auth_mode": "app_password",
-                                "auth_secret": "real-secret",
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
+            config_path = Path(tmpdir) / "config" / "accounts.json"
+            result = mail_core.setup_account(
+                provider="gmail",
+                email="user@example.com",
+                auth_code="real-secret",
+                display_name="Test User",
+                config_path=config_path,
+                recipients=[
+                    {"email": "main@example.com", "name": "Main", "main": True},
+                    {"email": "other@example.com", "name": "Other"},
+                ],
             )
-            result = mail_core.migrate_config(config_path)
             written = json.loads(config_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(result["migration_status"], "migrated")
-        self.assertEqual(written["version"], 2)
-        self.assertIn("work", written["accounts"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(written["setup"], 1)
+        self.assertEqual(written["sender"]["email"], "user@example.com")
+        self.assertEqual(written["sender"]["auth_code"], "real-secret")
+        self.assertEqual(len(written["recipients"]), 2)
+        self.assertTrue(written["recipients"][0]["main"])
 
-    def test_setup_account_create_and_update(self) -> None:
+    def test_setup_account_no_recipients(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "accounts.json"
-            with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-                created = mail_core.setup_account(
-                    account="work",
-                    provider="gmail",
-                    email="user@example.com",
-                    config_path=config_path,
-                    display_name="User One",
-                    auth_secret="real-secret",
-                )
-                updated = mail_core.setup_account(
-                    account="work",
-                    provider="gmail",
-                    email="user@example.com",
-                    config_path=config_path,
-                    display_name="User Two",
-                )
-            written = json.loads(config_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(created["status"], "ok")
-        self.assertEqual(updated["status"], "ok")
-        self.assertEqual(written["accounts"]["work"]["identity"]["display_name"], "User Two")
-
-    def test_doctor_account_detects_placeholder_secret(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "accounts.json"
-            mail_core.setup_account(
-                account="work",
+            config_path = Path(tmpdir) / "config" / "accounts.json"
+            result = mail_core.setup_account(
                 provider="gmail",
                 email="user@example.com",
                 config_path=config_path,
             )
-            doctor = mail_core.doctor_account(config_path)
+            written = json.loads(config_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(doctor["doctor_status"], "needs_attention")
-        self.assertIn("placeholder", doctor["accounts"][0]["issues"][0])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(written["recipients"], [])
 
-    def test_test_login_reports_both_channels(self) -> None:
+    def test_check_setup_blocks_when_not_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "accounts.json"
-            with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-                mail_core.setup_account(
-                    account="work",
-                    provider="gmail",
-                    email="user@example.com",
-                    config_path=config_path,
-                    auth_secret="real-secret",
-                )
-            with mock.patch.object(mail_core, "test_imap_login", return_value=None), mock.patch.object(
-                mail_core, "test_smtp_login", return_value=None
-            ):
-                result = mail_core.test_login(account="work", config_path=config_path)
+            config_path.write_text('{"setup": 0}', encoding="utf-8")
+            with self.assertRaises(mail_core.EmailClientError) as ctx:
+                mail_core.check_setup(config_path)
+            self.assertEqual(ctx.exception.code, "not_configured")
 
-        self.assertEqual(result["test_login_status"], "ok")
-        self.assertTrue(result["imap"]["ok"])
-        self.assertTrue(result["smtp"]["ok"])
+    def test_check_setup_passes_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            _new_config(config_path)
+            data = mail_core.check_setup(config_path)
+            self.assertEqual(data["setup"], 1)
+
+    def test_get_main_recipient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            _new_config(config_path)
+            main = mail_core.get_main_recipient(config_path)
+            self.assertEqual(main["email"], "main@example.com")
+            self.assertEqual(main["name"], "Main")
+
+    def test_get_main_recipient_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            path = config_path
+            path.write_text(json.dumps({
+                "setup": 1,
+                "sender": {"email": "x@x.com"},
+                "recipients": [],
+            }), encoding="utf-8")
+            with self.assertRaises(mail_core.EmailClientError) as ctx:
+                mail_core.get_main_recipient(config_path)
+            self.assertEqual(ctx.exception.code, "invalid_config")
+
+    def test_doctor_account_new_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            _new_config(config_path)
+            doctor = mail_core.doctor_account(config_path)
+        self.assertEqual(doctor["doctor_status"], "ok")
+
+    def test_doctor_account_detects_missing_auth_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            _new_config(config_path, auth_code="")
+            doctor = mail_core.doctor_account(config_path)
+        self.assertEqual(doctor["doctor_status"], "needs_attention")
+        self.assertIn("auth_code", doctor["issues"][0])
 
     def test_list_search_get_and_download_use_fake_mailbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "accounts.json"
-            with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-                mail_core.setup_account(
-                    account="work",
-                    provider="gmail",
-                    email="user@example.com",
-                    config_path=config_path,
-                    auth_secret="real-secret",
-                )
+            _new_config(config_path)
             with mock.patch.object(mail_core, "MailClient", FakeMailClient):
-                listed = mail_core.list_messages(account="work", config_path=config_path)
-                searched = mail_core.search_messages(account="work", query="invoice", config_path=config_path)
-                fetched = mail_core.get_message(account="work", uid="101", config_path=config_path)
-                downloaded = mail_core.download_attachments(account="work", uid="101", config_path=config_path)
+                listed = mail_core.list_messages(config_path=config_path)
+                searched = mail_core.search_messages(query="invoice", config_path=config_path)
+                fetched = mail_core.get_message(uid="101", config_path=config_path)
+                downloaded = mail_core.download_attachments(uid="101", config_path=config_path)
 
         self.assertEqual(len(listed["messages"]), 2)
         self.assertEqual(searched["messages"][0]["uid"], "101")
         self.assertEqual(fetched["message"]["uid"], "101")
         self.assertEqual(len(downloaded["files"]), 1)
 
-    def test_send_email_uses_approved_attachment_and_smtp(self) -> None:
+    def test_send_email_uses_main_recipient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            _new_config(config_path)
+            with mock.patch.object(mail_core.smtplib, "SMTP_SSL", FakeSMTP):
+                result = mail_core.send_email_tool(
+                    subject="Test",
+                    html_body="<p>Hello</p>",
+                    config_path=config_path,
+                )
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(FakeSMTP.sent_messages), 1)
+
+    def test_send_email_explicit_to(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "accounts.json"
             attachment_dir = Path(tmpdir) / "approved"
@@ -249,19 +263,10 @@ class MailToolsTests(unittest.TestCase):
             attachment_path = attachment_dir / "note.txt"
             attachment_path.write_text("hello", encoding="utf-8")
             mail_core._register_saved_attachments(attachment_dir, [attachment_path])
-
-            with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-                mail_core.setup_account(
-                    account="work",
-                    provider="gmail",
-                    email="user@example.com",
-                    config_path=config_path,
-                    auth_secret="real-secret",
-                )
+            _new_config(config_path)
 
             with mock.patch.object(mail_core.smtplib, "SMTP_SSL", FakeSMTP):
                 result = mail_core.send_email_tool(
-                    account="work",
                     to=["alice@example.com"],
                     subject="Test",
                     html_body="<p>Hello</p>",
@@ -285,32 +290,31 @@ class MailToolsTests(unittest.TestCase):
         self.assertEqual(result["output_path"], str(output_path))
         self.assertIn("Project update", result["html_draft"])
 
-    def test_tool_runner_returns_structured_json(self) -> None:
+    def test_tool_runner_dispatches_setup_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "accounts.json"
-            with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-                result = mail_tools.run_tool(
-                    "setup_account",
-                    {
-                        "account": "work",
-                        "provider": "gmail",
-                        "email": "user@example.com",
-                        "config_path": str(config_path),
-                    },
-                )
+            result = mail_tools.run_tool(
+                "setup_account",
+                {
+                    "provider": "gmail",
+                    "email": "user@example.com",
+                    "config_path": str(config_path),
+                },
+            )
 
         self.assertEqual(result["status"], "ok")
 
+    def test_tool_runner_blocks_when_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            config_path.write_text('{"setup": 0}', encoding="utf-8")
+            with self.assertRaises(mail_core.EmailClientError) as ctx:
+                mail_tools.run_tool("list_messages", {"config_path": str(config_path)})
+            self.assertEqual(ctx.exception.code, "not_configured")
+
     def _setup_mailbox(self, tmpdir):
         config_path = Path(tmpdir) / "accounts.json"
-        with mock.patch.object(mail_core, "KEYRING_AVAILABLE", False):
-            mail_core.setup_account(
-                account="work",
-                provider="gmail",
-                email="user@example.com",
-                config_path=config_path,
-                auth_secret="real-secret",
-            )
+        _new_config(config_path)
         return config_path
 
     def test_trash_preview_does_not_move(self) -> None:
@@ -320,7 +324,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
                  mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
                 result = mail_core.trash_messages(
-                    account="work", uids=["101"], confirmed=False, config_path=config_path
+                    uids=["101"], confirmed=False, config_path=config_path
                 )
         self.assertEqual(result["status"], "preview")
         self.assertEqual(result["trash_folder"], "Deleted Messages")
@@ -335,7 +339,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
                  mock.patch.object(mail_core, "_append_audit", lambda e: audit.append(e)):
                 result = mail_core.trash_messages(
-                    account="work", uids=["101"], confirmed=True, config_path=config_path
+                    uids=["101"], confirmed=True, config_path=config_path
                 )
         self.assertEqual(result["status"], "ok")
         self.assertEqual(FakeMailClient.moved, {"uids": ["101"], "dest": "Deleted Messages"})
@@ -348,7 +352,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient):
                 with self.assertRaises(mail_core.EmailClientError) as ctx:
                     mail_core.trash_messages(
-                        account="work", uids=["101"], confirmed=True,
+                        uids=["101"], confirmed=True,
                         folder="Deleted Messages", config_path=config_path,
                     )
         self.assertIn("already the trash", str(ctx.exception.message))
@@ -360,7 +364,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
                  mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
                 result = mail_core.purge_messages(
-                    account="work", uids=["101"], confirmed=False, config_path=config_path
+                    uids=["101"], confirmed=False, config_path=config_path
                 )
         self.assertEqual(result["status"], "preview")
         self.assertIsNone(FakeMailClient.expunged)
@@ -374,7 +378,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
                  mock.patch.object(mail_core, "_append_audit", lambda e: audit.append(e)):
                 result = mail_core.purge_messages(
-                    account="work", uids=["101"], confirmed=True, config_path=config_path
+                    uids=["101"], confirmed=True, config_path=config_path
                 )
         self.assertEqual(result["status"], "ok")
         self.assertEqual(FakeMailClient.flagged["flags"], "(\\Deleted)")
@@ -388,7 +392,7 @@ class MailToolsTests(unittest.TestCase):
             with mock.patch.object(mail_core, "MailClient", FakeMailClient), \
                  mock.patch.object(mail_core, "_append_audit", lambda *_a, **_k: None):
                 result = mail_core.restore_messages(
-                    account="work", uids=["101"], confirmed=True,
+                    uids=["101"], confirmed=True,
                     target_folder="INBOX", config_path=config_path,
                 )
         self.assertEqual(result["status"], "ok")
@@ -398,7 +402,7 @@ class MailToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = self._setup_mailbox(tmpdir)
             with mock.patch.object(mail_core, "MailClient", FakeMailClient):
-                result = mail_core.list_folders(account="work", config_path=config_path)
+                result = mail_core.list_folders(config_path=config_path)
         self.assertEqual(result["trash_folder"], "Deleted Messages")
         self.assertIn({"name": "INBOX", "raw_name": "INBOX", "attrs": "\\HasNoChildren", "delimiter": "/"}, result["folders"])
 

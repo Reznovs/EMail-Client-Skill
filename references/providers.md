@@ -10,16 +10,16 @@ Do not present other built-in presets as available.
 
 ## Config Location
 
-Default config file:
+Default config file（三平台统一）:
 
 ```text
-~/.config/codex-mail/accounts.json
+<project_root>/config/accounts.json
 ```
 
 Override path with:
 
 ```bash
-export CODEX_MAIL_ACCOUNTS=/custom/path/accounts.json
+export MAIL_OPS_ACCOUNTS=/custom/path/accounts.json
 ```
 
 ## Setup Sequence

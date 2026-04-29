@@ -3,7 +3,7 @@
 ## Model
 
 - **Two-tier, not three.** Soft delete is the default path; hard delete is only allowed on UIDs already inside the Trash folder. There is no "INBOX → permanent delete" shortcut.
-- **Every delete/restore/purge operation preserves an audit trail** at `~/.config/mail-ops/audit.log` (JSONL, UTC timestamps).
+- **Every delete/restore/purge operation preserves an audit trail** at `config/audit.log`（项目根目录下） (JSONL, UTC timestamps).
 
 ## Tools
 
@@ -16,10 +16,10 @@
 
 All four accept:
 
-- `account` (required)
 - `uids` (required, list of stringified integers, ≤ 50 per call)
 - `confirmed` (default `false`)
 - `trash_folder` (optional override)
+- `config_path` (optional, defaults to `config/accounts.json`)
 
 ## `confirmed` Gate
 

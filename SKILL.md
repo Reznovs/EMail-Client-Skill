@@ -64,7 +64,8 @@ Supported providers: `gmail`, `qq`, `custom`.
 - Use `send_email` only when the sending account, recipients, subject, HTML body, and attachment paths are clear.
 - **Attachment requirement:** Files passed to `send_email`'s `attachments` parameter must be in an approved directory (with a `.codex-mail-attachments.json` manifest). Files from `download_attachments` are auto-registered. For local files, call `register_attachments` first.
 - Use `send_scheduled_email` when the user asks for delayed delivery. It calls the Resend API with a `scheduled_at` timestamp; no local AI or OS scheduler is required.
-  - Requires `RESEND_API_KEY` environment variable (or `api_key` parameter).
+  - Resend API Key 优先从 sender.resend_api_key 读取，回退 `RESEND_API_KEY` 环境变量。
+  - 未传 `to` 时自动使用 main 收件人。
   - When the domain is not yet verified at Resend, `from` defaults to `onboarding@resend.dev` and recipients are restricted to the registered email address.
 - **All outgoing mail is HTML.** Compose the body with inline CSS so QQ Mail renders fonts, sizes, weights, colors, and backgrounds faithfully. Plain-text fallback is derived automatically — do not author it.
 - Use inline images (`cid:`) for custom emoji; Unicode emoji can go straight in the HTML.
@@ -87,7 +88,7 @@ Supported providers: `gmail`, `qq`, `custom`.
 
 **Never** call `purge_messages` on your own initiative; never bundle it with an initial "delete" request. The canonical flow is: `trash_messages` → (user reviews Trash) → optional `purge_messages` only if the user says so.
 
-All delete / restore / purge operations append a JSONL entry to `~/.config/mail-ops/audit.log` automatically; you do not need to maintain that log, but you may reference it when the user asks "what did I delete recently".
+All delete / restore / purge operations append a JSONL entry to `config/audit.log`（项目根目录下） automatically; you do not need to maintain that log, but you may reference it when the user asks "what did I delete recently".
 
 ## Output Rules
 

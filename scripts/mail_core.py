@@ -39,28 +39,15 @@ def _resolve_default_config() -> Path:
 
     优先级：
     1. 环境变量 `MAIL_OPS_ACCOUNTS`（新）或 `CODEX_MAIL_ACCOUNTS`（旧，向后兼容）
-    2. Windows: `%APPDATA%\\mail-ops\\accounts.json`
-       POSIX:   `${XDG_CONFIG_HOME:-$HOME/.config}/mail-ops/accounts.json`
-    3. 若上述新路径不存在、但旧版 `codex-mail/accounts.json` 仍在，则沿用旧路径。
-
-    凭据文件**始终位于用户主目录下的配置目录**，不在仓库内，开源仓库只需
-    在 `.gitignore` 中排除本机偶然生成的配置文件即可。
+    2. 项目本地：<项目根>/config/accounts.json（三平台统一）
     """
     for env_name in ("MAIL_OPS_ACCOUNTS", "CODEX_MAIL_ACCOUNTS"):
         value = os.environ.get(env_name)
         if value:
             return Path(value).expanduser()
 
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    else:
-        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-
-    new_path = Path(base) / "mail-ops" / "accounts.json"
-    legacy_path = Path(base) / "codex-mail" / "accounts.json"
-    if not new_path.exists() and legacy_path.exists():
-        return legacy_path
-    return new_path
+    project_root = Path(__file__).resolve().parent.parent
+    return project_root / "config" / "accounts.json"
 
 
 DEFAULT_CONFIG = _resolve_default_config()
@@ -179,6 +166,83 @@ def resolve_config_path(config: str | Path | None = None) -> Path:
     if isinstance(config, Path):
         return config.expanduser()
     return Path(config).expanduser()
+
+
+def check_setup(config_path: str | Path | None = None) -> dict[str, Any]:
+    """检查配置是否就绪。setup==0 或缺失则报错，否则返回完整配置 dict。"""
+    path = resolve_config_path(config_path)
+    data = _load_json(path)
+    if not data.get("setup"):
+        raise EmailClientError(
+            "配置未完成，请先调用 setup_account",
+            code="not_configured",
+        )
+    return data
+
+
+def _sender_to_account(sender: dict[str, Any]) -> AccountConfig:
+    """将 sender dict 转换为 AccountConfig，供下游 MailClient / send_email 使用。"""
+    provider = str(sender.get("provider") or "custom").strip().lower()
+    preset = PROVIDER_PRESETS.get(provider, {})
+    email = str(sender.get("email") or "").strip()
+    if not email:
+        raise EmailClientError("sender.email is required", code="invalid_config")
+
+    login_user = str(sender.get("login_user") or email).strip()
+    display_name = str(sender.get("display_name") or "").strip()
+    auth_code = str(sender.get("auth_code") or "").strip()
+
+    imap_raw = sender.get("imap")
+    smtp_raw = sender.get("smtp")
+    imap = _server_from_raw(imap_raw, fallback=preset.get("imap")) or (
+        preset.get("imap") if preset else None
+    )
+    smtp = _server_from_raw(smtp_raw, fallback=preset.get("smtp")) or (
+        preset.get("smtp") if preset else None
+    )
+    if imap is None or smtp is None:
+        raise EmailClientError("sender.imap and sender.smtp are required", code="invalid_config")
+
+    auth_mode = str(preset.get("auth_mode") or "auth_code").strip()
+
+    return AccountConfig(
+        name="sender",
+        provider=provider,
+        identity=IdentityConfig(email=email, login_user=login_user, display_name=display_name),
+        auth=AuthConfig(
+            mode=auth_mode,
+            storage="config_file",
+            secret=auth_code or auth_secret_placeholder(auth_mode),
+            keyring_key=None,
+        ),
+        imap=imap,
+        smtp=smtp,
+        proxy=None,
+    )
+
+
+def load_sender(config_path: str | Path | None = None) -> AccountConfig:
+    """从配置文件加载 sender 并返回 AccountConfig。"""
+    data = check_setup(config_path)
+    sender = data.get("sender")
+    if not isinstance(sender, dict):
+        raise EmailClientError("sender 配置缺失", code="invalid_config")
+    return _sender_to_account(sender)
+
+
+def get_main_recipient(config_path: str | Path | None = None) -> dict[str, str]:
+    """获取标记为 main 的默认收件人。"""
+    data = check_setup(config_path)
+    recipients = data.get("recipients")
+    if not isinstance(recipients, list) or not recipients:
+        raise EmailClientError("recipients 配置为空", code="invalid_config")
+    for r in recipients:
+        if isinstance(r, dict) and r.get("main"):
+            email = str(r.get("email") or "").strip()
+            if not email:
+                raise EmailClientError("main 收件人缺少 email 字段", code="invalid_config")
+            return {"email": email, "name": str(r.get("name") or "").strip()}
+    raise EmailClientError("未找到 main 标记的收件人", code="invalid_config")
 
 
 def render_config(data: dict[str, Any]) -> str:
@@ -571,14 +635,46 @@ def migrate_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
 def doctor_account(config_path: str | Path | None = None) -> dict[str, Any]:
     path = resolve_config_path(config_path)
-    result: dict[str, Any] = {"config": str(path), "accounts": []}
+    result: dict[str, Any] = {"config": str(path)}
     if not path.exists():
         result["doctor_status"] = "needs_attention"
         result["issues"] = ["account config does not exist"]
-        result["next_step"] = "run setup_account to create a v2 config."
+        result["next_step"] = "run setup_account to create config."
         return result
 
     raw = _load_json(path)
+
+    # 新格式：有 setup 字段
+    if "setup" in raw:
+        issues: list[str] = []
+        notes: list[str] = []
+        sender = raw.get("sender")
+        if not isinstance(sender, dict):
+            issues.append("sender 配置缺失")
+        else:
+            if not sender.get("email"):
+                issues.append("sender.email 缺失")
+            auth_code = str(sender.get("auth_code") or "").strip()
+            if not auth_code:
+                issues.append("sender.auth_code 缺失或使用占位符")
+            notes.append(f"provider: {sender.get('provider', 'unknown')}")
+            notes.append(f"email: {sender.get('email', 'unknown')}")
+
+        recipients = raw.get("recipients")
+        if not isinstance(recipients, list) or not recipients:
+            issues.append("recipients 为空")
+        else:
+            has_main = any(isinstance(r, dict) and r.get("main") for r in recipients)
+            if not has_main:
+                issues.append("无 main 标记的收件人")
+            notes.append(f"recipients: {len(recipients)}")
+
+        result["doctor_status"] = "needs_attention" if issues else "ok"
+        result["issues"] = issues
+        result["notes"] = notes
+        return result
+
+    # 旧 v2 格式兼容
     version = raw.get("version")
     if version != CONFIG_VERSION:
         result["doctor_status"] = "needs_attention"
@@ -593,13 +689,14 @@ def doctor_account(config_path: str | Path | None = None) -> dict[str, Any]:
         raise EmailClientError("config file must include an accounts object", code="invalid_config")
 
     any_issues = False
+    result["accounts"] = []
     for name, account_raw in accounts.items():
-        issues: list[str] = []
+        account_issues: list[str] = []
         notes: list[str] = []
         try:
             account = _account_from_v2(name, account_raw)
             if account.auth.storage == "config_file" and is_placeholder_secret(account.auth.secret):
-                issues.append("auth.secret is missing or still uses a placeholder")
+                account_issues.append("auth.secret is missing or still uses a placeholder")
             notes.append(f"auth_mode: {account.auth.mode}")
             notes.append(f"secret_storage: {account.auth.storage}")
             if account.proxy:
@@ -607,16 +704,16 @@ def doctor_account(config_path: str | Path | None = None) -> dict[str, Any]:
                     f"proxy: {account.proxy.type}://{account.proxy.host}:{account.proxy.port} (remote_dns={account.proxy.remote_dns})"
                 )
         except EmailClientError as exc:
-            issues.append(exc.message)
+            account_issues.append(exc.message)
         result["accounts"].append(
             {
                 "name": name,
-                "status": "needs_attention" if issues else "ok",
-                "issues": issues,
+                "status": "needs_attention" if account_issues else "ok",
+                "issues": account_issues,
                 "notes": notes,
             }
         )
-        if issues:
+        if account_issues:
             any_issues = True
     result["config_version"] = CONFIG_VERSION
     result["account_count"] = len(accounts)
@@ -714,208 +811,83 @@ def _merge_proxy(
 
 def setup_account(
     *,
-    account: str,
     provider: str,
     email: str,
-    config_path: str | Path | None = None,
-    login_user: str | None = None,
+    auth_code: str | None = None,
     display_name: str | None = None,
-    auth_mode: str | None = None,
-    auth_secret: str | None = None,
-    imap_host: str | None = None,
-    imap_port: int | None = None,
-    imap_no_ssl: bool = False,
-    imap_starttls: bool = False,
-    smtp_host: str | None = None,
-    smtp_port: int | None = None,
-    smtp_no_ssl: bool = False,
-    smtp_starttls: bool = False,
-    proxy_type: str | None = None,
-    proxy_host: str | None = None,
-    proxy_port: int | None = None,
-    proxy_username: str | None = None,
-    proxy_password: str | None = None,
-    proxy_remote_dns: bool = False,
-    proxy_local_dns: bool = False,
-    no_proxy: bool = False,
+    login_user: str | None = None,
+    resend_api_key: str | None = None,
+    recipients: list[dict[str, Any]] | None = None,
+    config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    name = _validate_account_name(account.strip())
+    """配置 sender 和 recipients，写入新格式 JSON，setup 设为 1。"""
     provider_name = provider.strip().lower()
     mailbox_email = email.strip()
-    if not name:
-        raise EmailClientError("account is required", code="invalid_setup")
     if not provider_name:
         raise EmailClientError("provider is required", code="invalid_setup")
     if not mailbox_email:
         raise EmailClientError("email is required", code="invalid_setup")
 
-    config = resolve_config_path(config_path)
-    document = load_v2_for_update(config)
-    existing_raw = document["accounts"].get(name)
-    existing_provider = str(existing_raw.get("provider") or "").strip().lower() if isinstance(existing_raw, dict) else ""
-    existing_identity = existing_raw.get("identity") if isinstance(existing_raw, dict) else {}
-    existing_auth = existing_raw.get("auth") if isinstance(existing_raw, dict) else {}
-    existing_servers = existing_raw.get("servers") if isinstance(existing_raw, dict) else {}
-    provider_changed = bool(existing_provider and existing_provider != provider_name)
-    email_changed = bool(
-        isinstance(existing_identity, dict)
-        and str(existing_identity.get("email") or "").strip()
-        and str(existing_identity.get("email") or "").strip() != mailbox_email
-    )
-    preserve_defaults = bool(existing_raw) and not provider_changed and not email_changed
-
     preset = PROVIDER_PRESETS.get(provider_name, {})
-    if preserve_defaults:
-        base_imap = _server_from_raw(
-            existing_servers.get("imap") if isinstance(existing_servers, dict) else None,
-            fallback=preset.get("imap"),
-        )
-        base_smtp = _server_from_raw(
-            existing_servers.get("smtp") if isinstance(existing_servers, dict) else None,
-            fallback=preset.get("smtp"),
-        )
-    else:
-        base_imap = preset.get("imap")
-        base_smtp = preset.get("smtp")
-
-    final_auth_mode = (
-        auth_mode
-        or (existing_auth.get("mode") if preserve_defaults and isinstance(existing_auth, dict) else None)
-        or preset.get("auth_mode")
-        or "password"
-    ).strip()
-    final_login_user = (
-        login_user
-        or (existing_identity.get("login_user") if preserve_defaults and isinstance(existing_identity, dict) else None)
-        or mailbox_email
-    ).strip()
-    final_display_name = (
-        display_name
-        or (existing_identity.get("display_name") if preserve_defaults and isinstance(existing_identity, dict) else None)
-        or mailbox_email
-    ).strip()
-
-    previous_storage = str(existing_auth.get("storage") or "config_file") if isinstance(existing_auth, dict) else "config_file"
-    previous_keyring_key = str(existing_auth.get("keyring_key") or "").strip() if isinstance(existing_auth, dict) else ""
-    previous_secret = str(existing_auth.get("secret") or "").strip() if isinstance(existing_auth, dict) else ""
-    secret_status = "provided"
-    secret_storage = previous_storage
-    keyring_key = previous_keyring_key or secret_keyring_name(name)
-    secret_value: str | None = None
-
-    if auth_secret is not None:
-        candidate = auth_secret.strip()
-        if is_placeholder_secret(candidate):
-            secret_status = "placeholder"
-            secret_storage = "config_file"
-            secret_value = auth_secret_placeholder(final_auth_mode)
-            if previous_storage == "keyring" and previous_keyring_key:
-                delete_secret_secure(previous_keyring_key)
-                keyring_key = None
-        else:
-            if store_secret_secure(name, candidate):
-                secret_storage = "keyring"
-                secret_value = candidate
-                keyring_key = secret_keyring_name(name)
-                if previous_storage == "keyring" and previous_keyring_key and previous_keyring_key != keyring_key:
-                    delete_secret_secure(previous_keyring_key)
-            else:
-                secret_storage = "config_file"
-                secret_value = candidate
-                keyring_key = None
-                if previous_storage == "keyring" and previous_keyring_key:
-                    delete_secret_secure(previous_keyring_key)
-    elif existing_raw:
-        if previous_storage == "keyring":
-            secret_storage = "keyring"
-            keyring_key = previous_keyring_key or secret_keyring_name(name)
-            secret_value = None
-        else:
-            secret_storage = "config_file"
-            secret_value = previous_secret or auth_secret_placeholder(final_auth_mode)
-            secret_status = "placeholder" if is_placeholder_secret(secret_value) else "provided"
-            keyring_key = None
-    else:
-        secret_storage = "config_file"
-        secret_status = "placeholder"
-        secret_value = auth_secret_placeholder(final_auth_mode)
-        keyring_key = None
-
-    if provider_name in PROVIDER_PRESETS:
-        final_imap = _merge_server(
-            base_imap or preset.get("imap"),
-            host=imap_host,
-            port=imap_port,
-            disable_ssl=imap_no_ssl,
-            starttls=imap_starttls,
-            required_name="imap",
-        )
-        final_smtp = _merge_server(
-            base_smtp or preset.get("smtp"),
-            host=smtp_host,
-            port=smtp_port,
-            disable_ssl=smtp_no_ssl,
-            starttls=smtp_starttls,
-            required_name="smtp",
-        )
-    else:
-        final_imap = _merge_server(
-            base_imap,
-            host=imap_host,
-            port=imap_port,
-            disable_ssl=imap_no_ssl,
-            starttls=imap_starttls,
-            required_name="custom imap",
-        )
-        final_smtp = _merge_server(
-            base_smtp,
-            host=smtp_host,
-            port=smtp_port,
-            disable_ssl=smtp_no_ssl,
-            starttls=smtp_starttls,
-            required_name="custom smtp",
+    if not preset:
+        raise EmailClientError(
+            f"不支持的 provider: {provider_name}，可选: {', '.join(PROVIDER_PRESETS.keys())}",
+            code="invalid_setup",
         )
 
-    final_proxy = _merge_proxy(
-        existing_raw.get("proxy") if isinstance(existing_raw, dict) else None,
-        proxy_type=proxy_type,
-        proxy_host=proxy_host,
-        proxy_port=proxy_port,
-        proxy_username=proxy_username,
-        proxy_password=proxy_password,
-        proxy_remote_dns=proxy_remote_dns,
-        proxy_local_dns=proxy_local_dns,
-        no_proxy=no_proxy,
-    )
+    imap_cfg = preset["imap"]
+    smtp_cfg = preset["smtp"]
 
-    account_config = AccountConfig(
-        name=name,
-        provider=provider_name,
-        identity=IdentityConfig(
-            email=mailbox_email,
-            login_user=final_login_user,
-            display_name=final_display_name,
-        ),
-        auth=AuthConfig(
-            mode=final_auth_mode,
-            storage=secret_storage,
-            secret=secret_value,
-            keyring_key=keyring_key if secret_storage == "keyring" else None,
-        ),
-        imap=final_imap,
-        smtp=final_smtp,
-        proxy=final_proxy,
-    )
-    document["accounts"][name] = serialize_account(account_config)
+    final_display_name = (display_name or mailbox_email).strip()
+    final_login_user = (login_user or mailbox_email).strip()
+    final_auth_code = (auth_code or "").strip()
+
+    sender: dict[str, Any] = {
+        "email": mailbox_email,
+        "login_user": final_login_user,
+        "display_name": final_display_name,
+        "provider": provider_name,
+        "auth_code": final_auth_code,
+        "imap": {"host": imap_cfg.host, "port": imap_cfg.port, "security": imap_cfg.security},
+        "smtp": {"host": smtp_cfg.host, "port": smtp_cfg.port, "security": smtp_cfg.security},
+    }
+    if resend_api_key and resend_api_key.strip():
+        sender["resend_api_key"] = resend_api_key.strip()
+
+    final_recipients: list[dict[str, Any]] = []
+    if recipients:
+        has_main = False
+        for r in recipients:
+            r_email = str(r.get("email") or "").strip()
+            if not r_email:
+                continue
+            is_main = bool(r.get("main"))
+            if is_main:
+                has_main = True
+            final_recipients.append({
+                "email": r_email,
+                "name": str(r.get("name") or "").strip(),
+                "main": is_main,
+            })
+        if not has_main and final_recipients:
+            final_recipients[0]["main"] = True
+
+    document: dict[str, Any] = {
+        "setup": 1,
+        "sender": sender,
+        "recipients": final_recipients,
+    }
+    config = resolve_config_path(config_path)
     _write_json(config, document)
+
+    secret_status = "provided" if final_auth_code else "placeholder"
     return {
         "status": "ok",
-        "account": name,
         "provider": provider_name,
+        "email": mailbox_email,
         "config": str(config),
-        "config_version": CONFIG_VERSION,
         "secret_status": secret_status,
-        "secret_storage": secret_storage,
+        "recipients_count": len(final_recipients),
         "provider_hint": provider_advice(provider_name),
     }
 
@@ -1716,12 +1688,11 @@ def test_smtp_login(account: AccountConfig) -> None:
 
 def list_messages(
     *,
-    account: str,
     config_path: str | Path | None = None,
     folder: str = DEFAULT_FOLDER,
     limit: int = DEFAULT_LIMIT,
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     messages: list[dict[str, Any]] = []
     with MailClient(mailbox) as client:
         client.select_folder(folder)
@@ -1734,14 +1705,13 @@ def list_messages(
 
 def search_messages(
     *,
-    account: str,
     query: str = "",
     config_path: str | Path | None = None,
     folder: str = DEFAULT_FOLDER,
     scan: int = DEFAULT_SCAN,
     limit: int = DEFAULT_LIMIT,
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     keyword = query.lower()
     messages: list[dict[str, Any]] = []
     with MailClient(mailbox) as client:
@@ -1770,12 +1740,11 @@ def search_messages(
 
 def get_message(
     *,
-    account: str,
     uid: str,
     config_path: str | Path | None = None,
     folder: str = DEFAULT_FOLDER,
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     with MailClient(mailbox) as client:
         client.select_folder(folder)
         msg = client.fetch_message(uid.encode())
@@ -1784,7 +1753,6 @@ def get_message(
 
 def download_attachments(
     *,
-    account: str,
     uid: str,
     mode: str = "temp",
     config_path: str | Path | None = None,
@@ -1792,7 +1760,7 @@ def download_attachments(
 ) -> dict[str, Any]:
     if mode not in {"temp", "archive"}:
         raise EmailClientError("mode must be temp or archive", code="invalid_request")
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     with MailClient(mailbox) as client:
         client.select_folder(folder)
         msg = client.fetch_message(uid.encode())
@@ -1905,10 +1873,9 @@ def _collect_previews(client: "MailClient", uids: list[bytes]) -> list[dict[str,
 
 def list_folders(
     *,
-    account: str,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     with MailClient(mailbox) as client:
         folders = client.list_folders()
     trash = _detect_trash_folder(folders)
@@ -1922,7 +1889,6 @@ def list_folders(
 
 def trash_messages(
     *,
-    account: str,
     uids: list[str] | str,
     confirmed: bool = False,
     folder: str = DEFAULT_FOLDER,
@@ -1930,7 +1896,7 @@ def trash_messages(
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """软删：从 folder 移到回收站。confirmed=False 时只返回预览，不执行。"""
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     uid_list = _normalize_uids(uids)
     with MailClient(mailbox) as client:
         folders = client.list_folders()
@@ -1987,7 +1953,6 @@ def trash_messages(
 
 def restore_messages(
     *,
-    account: str,
     uids: list[str] | str,
     confirmed: bool = False,
     target_folder: str = DEFAULT_FOLDER,
@@ -1995,7 +1960,7 @@ def restore_messages(
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """从回收站恢复到 target_folder。"""
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     uid_list = _normalize_uids(uids)
     with MailClient(mailbox) as client:
         folders = client.list_folders()
@@ -2041,14 +2006,13 @@ def restore_messages(
 
 def purge_messages(
     *,
-    account: str,
     uids: list[str] | str,
     confirmed: bool = False,
     trash_folder: str | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """硬删：只能对"已在回收站"的 UID 执行，且需要 confirmed=true。不可恢复。"""
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     uid_list = _normalize_uids(uids)
     with MailClient(mailbox) as client:
         folders = client.list_folders()
@@ -2107,9 +2071,8 @@ def _folder_equals(a: str, b: str) -> bool:
 
 def send_email_tool(
     *,
-    account: str,
-    to: str | list[str],
-    subject: str,
+    to: str | list[str] | None = None,
+    subject: str = "",
     html_body: str | None = None,
     plain_body: str | None = None,
     config_path: str | Path | None = None,
@@ -2120,7 +2083,12 @@ def send_email_tool(
     ics_event: dict[str, Any] | None = None,
     ics_filename: str = "invite.ics",
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
+
+    # to 未传时自动使用 main 收件人
+    if to is None:
+        main = get_main_recipient(config_path)
+        to = main["email"]
 
     final_html_body = html_body
     if final_html_body is None:
@@ -2148,12 +2116,11 @@ def send_email_tool(
 
 def test_login(
     *,
-    account: str,
     config_path: str | Path | None = None,
     imap_only: bool = False,
     smtp_only: bool = False,
 ) -> dict[str, Any]:
-    mailbox = load_account(account, config_path)
+    mailbox = load_sender(config_path)
     imap_result = {"tested": not smtp_only, "ok": False, "error": ""}
     smtp_result = {"tested": not imap_only, "ok": False, "error": ""}
 
@@ -2321,26 +2288,58 @@ RESEND_API_BASE = "https://api.resend.com/emails"
 
 def send_scheduled_email(
     *,
-    to: str | list[str],
-    subject: str,
-    html_body: str,
+    to: str | list[str] | None = None,
+    subject: str = "",
+    html_body: str = "",
     from_addr: str | None = None,
     api_key: str | None = None,
     delay_minutes: int | None = None,
     scheduled_at: str | None = None,
+    config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """通过 Resend API 创建定时邮件任务。纯 HTTP，零系统依赖，跨平台。
 
     参数:
-        to: 收件人地址（字符串或列表）。
+        to: 收件人地址（字符串或列表）。未传时自动使用 main 收件人。
         subject: 邮件主题。
         html_body: HTML 正文。
-        from_addr: 发件人地址。默认从环境变量 RESEND_FROM 读取，回退 onboarding@resend.dev。
-        api_key: Resend API Key。默认从环境变量 RESEND_API_KEY 读取。
+        from_addr: 发件人地址。默认从 sender.email 读取，回退环境变量 RESEND_FROM。
+        api_key: Resend API Key。优先从 sender.resend_api_key 读取，回退环境变量。
         delay_minutes: 几分钟后发送（与 scheduled_at 二选一）。
         scheduled_at: 明确的 ISO 8601 字符串（与 delay_minutes 二选一）。
+        config_path: 配置文件路径。
     """
-    key = (api_key or os.environ.get("RESEND_API_KEY", "")).strip()
+    # to 未传时自动使用 main 收件人
+    if to is None:
+        main = get_main_recipient(config_path)
+        to = main["email"]
+
+    # 优先从配置读取 sender 的 key 和 email
+    sender_cfg: dict[str, Any] | None = None
+    try:
+        data = check_setup(config_path)
+        sender_cfg = data.get("sender") if isinstance(data.get("sender"), dict) else None
+    except Exception:
+        pass
+
+    key = (
+        api_key
+        or (sender_cfg or {}).get("resend_api_key")
+        or os.environ.get("RESEND_API_KEY", "")
+    ).strip()
+    if not key:
+        raise EmailClientError(
+            "Resend API Key 缺失。请在 sender.resend_api_key 中配置或设置 RESEND_API_KEY 环境变量。",
+            code="missing_api_key",
+        )
+
+    sender = (
+        from_addr
+        or (sender_cfg or {}).get("email")
+        or os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+    ).strip()
+    if not sender:
+        sender = "onboarding@resend.dev"
     if not key:
         raise EmailClientError(
             "Resend API Key 缺失。请设置 RESEND_API_KEY 环境变量或在参数中传入 api_key。",

@@ -11,6 +11,7 @@ from typing import Any, Callable
 from mail_core import (
     DEFAULT_CONFIG,
     EmailClientError,
+    check_setup,
     doctor_account,
     download_attachments,
     draft_email,
@@ -50,10 +51,16 @@ TOOL_MAP: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
+_SKIP_SETUP_CHECK = {"setup_account", "migrate_config"}
+
+
 def run_tool(tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
     handler = TOOL_MAP.get(tool_name)
     if handler is None:
         raise EmailClientError(f"unknown tool: {tool_name}", code="unknown_tool")
+    # 配置工具自身跳过检查，其余工具需 setup==1
+    if tool_name not in _SKIP_SETUP_CHECK:
+        check_setup(payload.get("config_path"))
     return handler(**payload)
 
 
