@@ -354,6 +354,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Force UTF-8 on Windows to prevent UnicodeEncodeError with GBK console
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     args = parser.parse_args()
     try:

@@ -6,6 +6,16 @@ __pycache__/
 *.bak
 *.swp
 *.swo
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# IDE / Editor
+.vscode/
+.idea/
+*.code-workspace
+.cursor/
+.cursorrules
 
 # 本地凭据与运行产物（绝不进仓库）
 config/accounts.json
@@ -18,6 +28,10 @@ audit.log
 .mail-ops-attachments.json
 *.ics.local
 CLAUDE.md
+.claude/
+
+# 项目无关目录
+issues/
 
 # 但示例文件要允许
 !references/accounts.example.json

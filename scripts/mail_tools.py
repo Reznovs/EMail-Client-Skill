@@ -83,6 +83,12 @@ def load_payload(input_json: str | None, input_file: str | None) -> dict[str, An
 
 
 def main() -> None:
+    # Force UTF-8 on Windows to prevent UnicodeEncodeError with GBK console
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Local JSON tool-call entrypoint for email-client-skill.")
     parser.add_argument("tool_name", choices=sorted(TOOL_MAP.keys()))
     parser.add_argument("--input-json")
